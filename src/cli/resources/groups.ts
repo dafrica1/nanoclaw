@@ -257,26 +257,40 @@ registerResource({
       access: 'approval',
       description:
         'Add an MCP server to a group. Requires `ncl groups restart` to take effect. ' +
-        'Use --id <group-id> --name <server-name> --command <cmd> [--args <json-array>] [--env <json-object>].',
+        'Stdio: --id <group-id> --name <name> --command <cmd> [--args <json-array>] [--env <json-object>]. ' +
+        'HTTP: --id <group-id> --name <name> --transport http --url <url> [--headers <json-object>].',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const name = args.name as string;
         if (!name) throw new Error('--name is required');
-        const command = args.command as string;
-        if (!command) throw new Error('--command is required');
 
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
         const servers = JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>;
-        servers[name] = {
-          command,
-          args: args.args ? (JSON.parse(args.args as string) as string[]) : [],
-          env: args.env ? (JSON.parse(args.env as string) as Record<string, string>) : {},
-        };
-        updateContainerConfigJson(id, 'mcp_servers', servers);
 
+        const transport = (args.transport as string) || 'stdio';
+        if (transport === 'http' || transport === 'https') {
+          let url = args.url as string;
+          if (!url) throw new Error('--url is required for HTTP transport');
+          if (transport === 'https') url = url.replace(/^http:/, 'https:');
+          servers[name] = {
+            type: 'http',
+            url,
+            headers: args.headers ? (JSON.parse(args.headers as string) as Record<string, string>) : undefined,
+          };
+        } else {
+          const command = args.command as string;
+          if (!command) throw new Error('--command is required for stdio transport');
+          servers[name] = {
+            command,
+            args: args.args ? (JSON.parse(args.args as string) as string[]) : [],
+            env: args.env ? (JSON.parse(args.env as string) as Record<string, string>) : {},
+          };
+        }
+
+        updateContainerConfigJson(id, 'mcp_servers', servers);
         return { added: name, servers };
       },
     },

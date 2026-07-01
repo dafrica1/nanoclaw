@@ -89,6 +89,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // a Codex thread id never gets handed to Claude or vice versa.
   let continuation: string | undefined = migrateLegacyContinuation(config.providerName);
 
+  // Track the most recent non-agent routing so errors from A2A-triggered turns
+  // fall back to the real channel (e.g. Telegram) rather than looping back to
+  // the agent via the A2A path.
+  let lastChannelRouting: RoutingContext | null = null;
+  // Exchange counter: nudge the user to /compact after enough turns so context
+  // overflow is visible before it becomes a problem.
+  let exchangeCount = 0;
+  const CONTEXT_WARN_EXCHANGES = 30;
+
   // Before resuming, drop a session whose on-disk transcript has grown too
   // large/old to cold-resume within the host's idle ceiling. Without this a
   // long-lived hub keeps trying to reload an ever-growing .jsonl, hangs the
@@ -99,6 +108,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       log(`Rotating session — ${rotateReason}; starting fresh`);
       clearContinuation(config.providerName);
       continuation = undefined;
+      exchangeCount = 0;
     }
   }
 
@@ -146,6 +156,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markProcessing(ids);
 
     const routing = extractRouting(messages);
+    if (routing.channelType !== 'agent') {
+      lastChannelRouting = routing;
+    }
+    const errorRouting = routing.channelType === 'agent' && lastChannelRouting ? lastChannelRouting : routing;
 
     // Command handling: the host router gates filtered and unauthorized
     // admin commands before they reach the container. The only command
@@ -157,6 +171,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isClearCommand(msg)) {
         log('Clearing session (resetting continuation)');
         continuation = undefined;
+        exchangeCount = 0;
         clearContinuation(config.providerName);
         writeMessageOut({
           id: generateId(),
@@ -247,10 +262,24 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config.provider.onExchangeComplete?.bind(config.provider),
         prompt,
         continuation,
+        errorRouting !== routing ? errorRouting : undefined,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
+      }
+      exchangeCount++;
+      if (exchangeCount === CONTEXT_WARN_EXCHANGES && lastChannelRouting) {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: lastChannelRouting.platformId,
+          channel_type: lastChannelRouting.channelType,
+          thread_id: lastChannelRouting.threadId,
+          content: JSON.stringify({
+            text: `Your conversation context is getting large (${exchangeCount} exchanges). Send /compact to compress it and keep things running smoothly.`,
+          }),
+        });
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -262,16 +291,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (continuation && config.provider.isSessionInvalid(err)) {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
+        exchangeCount = 0;
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
+      // Write error response so the user knows something went wrong.
+      // Use errorRouting so errors from A2A-triggered turns surface to the
+      // real channel (e.g. Telegram) instead of looping back to the agent.
       writeMessageOut({
         id: generateId(),
         kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
+        platform_id: errorRouting.platformId,
+        channel_type: errorRouting.channelType,
+        thread_id: errorRouting.threadId,
         content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
     } finally {
@@ -331,6 +363,7 @@ export async function processQuery(
   onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
   initialPrompt: string,
   initialContinuation: string | undefined,
+  fallbackRouting?: RoutingContext,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -488,7 +521,7 @@ export async function processQuery(
             // <message> envelope: deliver the notice instead of dropping it as
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
             // the failing gateway turn after turn.
-            deliverErrorResult(event.text, routing);
+            deliverErrorResult(event.text, routing, fallbackRouting);
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
@@ -578,16 +611,26 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * no <message> envelope: the notice would otherwise be dropped as scratchpad.
  * This is the same user-facing write the outer catch block does, minus the
  * `Error:` prefix — the provider's text is already a user-facing message.
+ *
+ * When the triggering batch arrived via A2A (channel_type === 'agent'), routing
+ * the error back to the source agent creates a feedback loop: the agent retries,
+ * hits the same error, and loops indefinitely. Fall back to the most recent
+ * real-channel routing so the error surfaces to the user instead.
  */
-function deliverErrorResult(text: string, routing: RoutingContext): void {
-  log('Error result with no <message> envelope — delivering to channel');
+function deliverErrorResult(text: string, routing: RoutingContext, fallbackRouting?: RoutingContext): void {
+  const target = routing.channelType === 'agent' && fallbackRouting ? fallbackRouting : routing;
+  if (target !== routing) {
+    log('Error result from A2A-triggered turn — delivering to channel instead of routing back to agent');
+  } else {
+    log('Error result with no <message> envelope — delivering to channel');
+  }
   writeMessageOut({
     id: generateId(),
     in_reply_to: routing.inReplyTo,
     kind: 'chat',
-    platform_id: routing.platformId,
-    channel_type: routing.channelType,
-    thread_id: routing.threadId,
+    platform_id: target.platformId,
+    channel_type: target.channelType,
+    thread_id: target.threadId,
     content: JSON.stringify({ text }),
   });
 }

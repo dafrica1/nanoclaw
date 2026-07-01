@@ -6,6 +6,7 @@
  * instead of environment variables.
  */
 import fs from 'fs';
+import type { McpServerConfig } from './providers/types.js';
 
 const CONFIG_PATH = '/workspace/agent/container.json';
 
@@ -15,7 +16,7 @@ export interface RunnerConfig {
   groupName: string;
   agentGroupId: string;
   maxMessagesPerPrompt: number;
-  mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+  mcpServers: Record<string, McpServerConfig>;
   model?: string;
   effort?: string;
 }

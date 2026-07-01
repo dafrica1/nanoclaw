@@ -82,37 +82,60 @@ export const addMcpServer: McpToolDefinition = {
   tool: {
     name: 'add_mcp_server',
     description:
-      'Wire an EXISTING third-party MCP server into YOUR per-agent runtime config — you must already know the exact `command` + `args` to invoke it (e.g. `npx @modelcontextprotocol/server-github`). Requires admin approval; fire-and-forget.',
+      'Wire an EXISTING third-party MCP server into YOUR per-agent runtime config. ' +
+      'For stdio servers, supply `command` + `args` (e.g. `npx @modelcontextprotocol/server-github`). ' +
+      'For HTTP/remote servers, supply `url` instead (e.g. `https://agent.robinhood.com/mcp/trading`). ' +
+      'Requires admin approval; fire-and-forget.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         name: { type: 'string', description: 'MCP server name (unique identifier)' },
-        command: { type: 'string', description: 'Command to run the MCP server' },
-        args: { type: 'array', items: { type: 'string' }, description: 'Command arguments' },
-        env: { type: 'object', description: 'Environment variables for the server' },
+        command: { type: 'string', description: 'Command to run the MCP server (stdio transport)' },
+        args: { type: 'array', items: { type: 'string' }, description: 'Command arguments (stdio transport)' },
+        env: { type: 'object', description: 'Environment variables for the server (stdio transport)' },
+        url: { type: 'string', description: 'HTTP/HTTPS URL of the remote MCP server (HTTP transport)' },
+        headers: { type: 'object', description: 'HTTP headers to send with every request (HTTP transport)' },
       },
-      required: ['name', 'command'],
+      required: ['name'],
     },
   },
   async handler(args) {
     const name = args.name as string;
-    const command = args.command as string;
-    if (!name || !command) return err('name and command are required');
+    const command = args.command as string | undefined;
+    const url = args.url as string | undefined;
+
+    if (!name) return err('name is required');
+    if (!command && !url) return err('either command (stdio) or url (HTTP) is required');
 
     const requestId = generateId();
-    writeMessageOut({
-      id: requestId,
-      kind: 'system',
-      content: JSON.stringify({
-        action: 'add_mcp_server',
-        name,
-        command,
-        args: (args.args as string[]) || [],
-        env: (args.env as Record<string, string>) || {},
-      }),
-    });
 
-    log(`add_mcp_server: ${requestId} → "${name}" (${command})`);
+    if (url) {
+      writeMessageOut({
+        id: requestId,
+        kind: 'system',
+        content: JSON.stringify({
+          action: 'add_mcp_server',
+          name,
+          url,
+          headers: (args.headers as Record<string, string>) || {},
+        }),
+      });
+      log(`add_mcp_server: ${requestId} → "${name}" (${url})`);
+    } else {
+      writeMessageOut({
+        id: requestId,
+        kind: 'system',
+        content: JSON.stringify({
+          action: 'add_mcp_server',
+          name,
+          command,
+          args: (args.args as string[]) || [],
+          env: (args.env as Record<string, string>) || {},
+        }),
+      });
+      log(`add_mcp_server: ${requestId} → "${name}" (${command})`);
+    }
+
     return ok(`MCP server request submitted. You will be notified when admin approves or rejects.`);
   },
 };
